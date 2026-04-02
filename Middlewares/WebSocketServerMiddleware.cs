@@ -35,6 +35,7 @@ namespace WebSocketServer.Middlewares
                 
                 // Join default room
                 _roomService.JoinRoom("general", user.ConnectionId);
+                user.JoinedRooms.Add("general");
 
                 // Send welcome message
                 await SendWelcomeAsync(user);
@@ -47,6 +48,9 @@ namespace WebSocketServer.Middlewares
                 
                 // Send message history for general room
                 await SendRoomHistoryAsync(user, "general");
+                
+                // Send initial room list (will include general)
+                await SendRoomListAsync(user);
 
                 await ReceiveMessageAsync(webSocket, async (result, bytes) =>
                 {
@@ -92,6 +96,9 @@ namespace WebSocketServer.Middlewares
                     case MessageType.TypingStop:
                         await HandleTypingStopAsync(user, json);
                         break;
+                    case MessageType.RoomCreate:
+                        await HandleRoomCreateAsync(user, json);
+                        break;
                     case MessageType.RoomJoin:
                         await HandleRoomJoinAsync(user, json);
                         break;
@@ -100,6 +107,9 @@ namespace WebSocketServer.Middlewares
                         break;
                     case MessageType.RoomList:
                         await SendRoomListAsync(user);
+                        break;
+                    case MessageType.RoomExists:
+                        await HandleRoomExistsAsync(user, json);
                         break;
                     case MessageType.UserList:
                         await SendUserListAsync(user);
@@ -263,7 +273,7 @@ namespace WebSocketServer.Middlewares
             await BroadcastToRoomAsync(roomName, JsonConvert.SerializeObject(typingMessage), user.ConnectionId);
         }
 
-        private async Task HandleRoomJoinAsync(User user, JObject json)
+        private async Task HandleRoomCreateAsync(User user, JObject json)
         {
             var roomName = json["RoomName"]?.ToString() ?? json["roomName"]?.ToString();
             
@@ -273,31 +283,154 @@ namespace WebSocketServer.Middlewares
                 return;
             }
 
-            user.JoinedRooms.Add(roomName);
-            _roomService.JoinRoom(roomName, user.ConnectionId);
+            // Validate room name
+            if (roomName.Length > 50 || roomName.Contains('_'))
+            {
+                await SendErrorAsync(user, "Invalid room name. Max 50 characters, no underscores allowed.");
+                return;
+            }
+
+            // Check if room already exists
+            if (_roomService.RoomExists(roomName))
+            {
+                await SendErrorAsync(user, $"Room '{roomName}' already exists");
+                return;
+            }
+
+            // Create the room with creator as first member
+            var room = _roomService.CreateRoom(roomName, user.ConnectionId, isPrivate: true);
+            if (room == null)
+            {
+                await SendErrorAsync(user, $"Failed to create room '{roomName}'");
+                return;
+            }
+
+            user.JoinedRooms.Add(roomName.ToLowerInvariant());
+
+            // Send confirmation
+            var createConfirmation = new
+            {
+                Type = MessageType.RoomCreate,
+                RoomName = room.Name,
+                Success = true,
+                Timestamp = DateTime.UtcNow
+            };
+            await SendAsync(user.Socket, JsonConvert.SerializeObject(createConfirmation));
+
+            // Send updated room list
+            await SendRoomListAsync(user);
+        }
+
+        private async Task HandleRoomExistsAsync(User user, JObject json)
+        {
+            var roomName = json["RoomName"]?.ToString() ?? json["roomName"]?.ToString();
+            
+            var exists = !string.IsNullOrEmpty(roomName) && _roomService.RoomExists(roomName);
+            
+            var response = new
+            {
+                Type = MessageType.RoomExists,
+                RoomName = roomName,
+                Exists = exists,
+                Timestamp = DateTime.UtcNow
+            };
+            await SendAsync(user.Socket, JsonConvert.SerializeObject(response));
+        }
+
+        private async Task HandleRoomJoinAsync(User user, JObject json)
+        {
+            var roomName = json["RoomName"]?.ToString() ?? json["roomName"]?.ToString();
+            var targetUserId = json["TargetUserId"]?.ToString() ?? json["targetUserId"]?.ToString();
+            
+            if (string.IsNullOrEmpty(roomName) && string.IsNullOrEmpty(targetUserId))
+            {
+                await SendErrorAsync(user, "Room name or target user is required");
+                return;
+            }
+
+            bool isDm = false;
+            
+            // If targetUserId is provided, this is a DM chat request
+            if (!string.IsNullOrEmpty(targetUserId))
+            {
+                roomName = ChatRoomService.GetPrivateRoomId(user.ConnectionId, targetUserId);
+                var room = _roomService.GetOrCreateDmRoom(user.ConnectionId, targetUserId);
+                isDm = true;
+                
+                // Also add the other user to the room if they're online
+                var targetUser = _connectionManager.GetUser(targetUserId);
+                if (targetUser != null)
+                {
+                    _roomService.JoinRoom(roomName, targetUserId);
+                    targetUser.JoinedRooms.Add(roomName);
+                }
+            }
+            else
+            {
+                // For regular rooms, check if it exists first
+                if (!_roomService.RoomExists(roomName))
+                {
+                    await SendErrorAsync(user, $"Room '{roomName}' does not exist");
+                    return;
+                }
+            }
+
+            // Join the room
+            bool? joinResult = _roomService.JoinRoom(roomName!, user.ConnectionId);
+            if (joinResult == null)
+            {
+                // Room doesn't exist (shouldn't happen for DM rooms)
+                await SendErrorAsync(user, $"Failed to join room '{roomName}'");
+                return;
+            }
+            
+            user.JoinedRooms.Add(roomName!);
+            isDm = isDm || ChatRoomService.IsDmRoom(roomName!);
+            
+            // For DM rooms, include the other user's username
+            string? otherUsername = null;
+            if (isDm)
+            {
+                var otherUserId = ChatRoomService.GetOtherUserInDmRoom(roomName!, user.ConnectionId);
+                if (otherUserId != null)
+                {
+                    var otherUser = _connectionManager.GetUser(otherUserId);
+                    otherUsername = otherUser?.Username;
+                }
+            }
 
             // Notify user
-            var joinConfirmation = new RoomMessage(MessageType.RoomJoin)
+            var joinConfirmation = new
             {
+                Type = MessageType.RoomJoin,
                 RoomName = roomName,
-                Users = _connectionManager.GetUsersInRoom(roomName).Select(u => u.Username).ToList()
+                IsDm = isDm,
+                OtherUsername = otherUsername,
+                Users = _connectionManager.GetUsersInRoom(roomName!).Select(u => u.Username).ToList(),
+                Timestamp = DateTime.UtcNow
             };
             await SendAsync(user.Socket, JsonConvert.SerializeObject(joinConfirmation));
 
             // Send room history
-            await SendRoomHistoryAsync(user, roomName);
+            await SendRoomHistoryAsync(user, roomName!);
 
-            // Notify room members
-            var notification = new
+            // Only broadcast join notification for non-DM rooms
+            if (!isDm)
             {
-                Type = MessageType.Text,
-                From = "System",
-                FromUsername = "System",
-                Content = $"{user.Username} joined the room",
-                RoomName = roomName,
-                Timestamp = DateTime.UtcNow
-            };
-            await BroadcastToRoomAsync(roomName, JsonConvert.SerializeObject(notification), user.ConnectionId);
+                var notification = new
+                {
+                    Type = MessageType.Text,
+                    From = "System",
+                    FromUsername = "System",
+                    Content = $"{user.Username} joined the room",
+                    RoomName = roomName,
+                    Timestamp = DateTime.UtcNow
+                };
+                await BroadcastToRoomAsync(roomName!, JsonConvert.SerializeObject(notification), user.ConnectionId);
+            }
+            
+            // Send updated room list
+            await SendRoomListAsync(user);
         }
 
         private async Task HandleRoomLeaveAsync(User user, JObject json)
@@ -310,6 +443,8 @@ namespace WebSocketServer.Middlewares
                 return;
             }
 
+            var isDm = ChatRoomService.IsDmRoom(roomName);
+            
             user.JoinedRooms.Remove(roomName);
             _roomService.LeaveRoom(roomName, user.ConnectionId);
 
@@ -317,17 +452,23 @@ namespace WebSocketServer.Middlewares
             var leaveConfirmation = new RoomMessage(MessageType.RoomLeave) { RoomName = roomName };
             await SendAsync(user.Socket, JsonConvert.SerializeObject(leaveConfirmation));
 
-            // Notify room members
-            var notification = new
+            // Only broadcast leave notification for non-DM rooms
+            if (!isDm)
             {
-                Type = MessageType.Text,
-                From = "System",
-                FromUsername = "System",
-                Content = $"{user.Username} left the room",
-                RoomName = roomName,
-                Timestamp = DateTime.UtcNow
-            };
-            await BroadcastToRoomAsync(roomName, JsonConvert.SerializeObject(notification), null);
+                var notification = new
+                {
+                    Type = MessageType.Text,
+                    From = "System",
+                    FromUsername = "System",
+                    Content = $"{user.Username} left the room",
+                    RoomName = roomName,
+                    Timestamp = DateTime.UtcNow
+                };
+                await BroadcastToRoomAsync(roomName, JsonConvert.SerializeObject(notification), null);
+            }
+            
+            // Send updated room list
+            await SendRoomListAsync(user);
         }
 
         private async Task HandleReadReceiptAsync(User user, JObject json)
@@ -529,7 +670,8 @@ namespace WebSocketServer.Middlewares
 
         private async Task SendRoomListAsync(User user)
         {
-            var rooms = _roomService.GetAllRooms().Select(r => new RoomInfo
+            // Only return rooms the user is a member of (excluding DM rooms)
+            var rooms = _roomService.GetUserRooms(user.ConnectionId).Select(r => new RoomInfo
             {
                 Name = r.Name,
                 UserCount = r.MemberConnectionIds.Count
