@@ -1,0 +1,112 @@
+# ASP.NET Core WebSocket Server - Azure Pipelines Configuration
+# Build, test, and deploy ASP.NET Core WebSocket server to Azure
+# Reference: https://docs.microsoft.com/azure/devops/pipelines/languages/dotnet-core
+
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    exclude:
+    - README.md
+    - docs/*
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  buildConfiguration: 'Release'
+  dotnetVersion: '10.0.x'
+  projectPath: '.'
+  artifactName: 'drop'
+
+stages:
+- stage: Build
+  displayName: 'Build & Test'
+  jobs:
+  - job: BuildAndTest
+    displayName: 'Build and Test Job'
+    steps:
+    
+    - task: UseDotNet@2
+      displayName: 'Use .NET $(dotnetVersion)'
+      inputs:
+        version: $(dotnetVersion)
+        packageType: sdk
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore NuGet packages'
+      inputs:
+        command: 'restore'
+        projects: '$(projectPath)/**/*.csproj'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build $(buildConfiguration)'
+      inputs:
+        command: 'build'
+        arguments: '--configuration $(buildConfiguration) --no-restore'
+        projects: '$(projectPath)/**/*.csproj'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Run Tests'
+      inputs:
+        command: 'test'
+        arguments: '--configuration $(buildConfiguration) --no-build --verbosity normal'
+        projects: '$(projectPath)/**/*Tests.csproj'
+      continueOnError: true
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Publish Release'
+      inputs:
+        command: 'publish'
+        publishWebProjects: true
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifacts'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: $(artifactName)
+        publishLocation: 'Container'
+
+- stage: Deploy
+  displayName: 'Deploy to Azure'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: Deploy
+    displayName: 'Deploy WebSocket Server'
+    environment: 'production'  # Change to your environment name
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          
+          - download: current
+            artifact: $(artifactName)
+            displayName: 'Download published artifacts'
+
+          # Uncomment and configure one of the deployment options below:
+          
+          # Option 1: Deploy to Azure App Service
+          - task: AzureWebApp@1
+            displayName: 'Deploy to Azure App Service'
+            inputs:
+              azureSubscription: 'Azure_first_subscription'
+              appType: 'webAppLinux'
+              appName: 'WebSocketServer'
+              slotName: 'production'
+              deploymentMethod: 'zipDeploy'
+              package: '$(Pipeline.Workspace)/$(artifactName)/**/publish'
+
+          # Option 2: Deploy to Azure Container Registry
+          # - task: Docker@2
+          #   displayName: 'Build and push Docker image'
+          #   inputs:
+          #     command: buildAndPush
+          #     repository: 'websocketserver'
+          #     dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+          #     containerRegistry: 'YOUR_ACR_CONNECTION'
+          #     tags: |
+          #       $(Build.BuildId)
+          #       latest
